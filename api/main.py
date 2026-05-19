@@ -73,6 +73,16 @@ def _init_schema(cur: psycopg2.extensions.cursor) -> None:
         );
         """
     )
+    # Tabla de reclamos: un auditor "reclama" un registro para indicar que lo está revisando
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claims (
+            key        TEXT PRIMARY KEY,
+            auditor    TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
     # Migración no destructiva: agregar columnas si no existen (por si la DB
     # fue creada con una versión anterior de este esquema)
     for col, definition in [
@@ -400,3 +410,97 @@ def stats() -> dict:
         "rechazadas": int(row[1] or 0),
         "pendientes": int(row[2] or 0),
     }
+
+
+# ── Claims (bloqueo de registro en revisión) ──────────────────────────────────
+
+CLAIM_TTL_MINUTES = 5  # un reclamo expira si no se renueva en este tiempo
+
+
+@app.get("/api/claims")
+def get_claims() -> dict:
+    """
+    Devuelve todos los reclamos activos (no expirados).
+    Formato: { key: auditor, ... }
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT key, auditor FROM claims
+                WHERE claimed_at > NOW() - INTERVAL '%s minutes'
+                """,
+                (CLAIM_TTL_MINUTES,),
+            )
+            rows = cur.fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+@app.post("/api/claims/{key}", status_code=200)
+def claim_record(key: str, auditor: str) -> dict:
+    """
+    Reclama un registro para el auditor indicado.
+    - Si ya existe un reclamo activo de OTRO auditor → 409.
+    - Si el mismo auditor ya lo tiene (heartbeat) → renueva y devuelve 200.
+    - Si no hay reclamo activo → inserta y devuelve 200.
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT auditor FROM claims
+                WHERE key = %s
+                  AND claimed_at > NOW() - INTERVAL '%s minutes'
+                """,
+                (key, CLAIM_TTL_MINUTES),
+            )
+            row = cur.fetchone()
+
+        if row and row[0] != auditor:
+            raise HTTPException(
+                status_code=409,
+                detail=f"En revisión por {row[0]}",
+            )
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO claims (key, auditor, claimed_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE
+                    SET auditor    = EXCLUDED.auditor,
+                        claimed_at = EXCLUDED.claimed_at
+                """,
+                (key, auditor),
+            )
+        conn.commit()
+    return {"ok": True, "key": key, "auditor": auditor}
+
+
+@app.delete("/api/claims/{key}")
+def release_claim(key: str) -> dict:
+    """Libera el reclamo de un registro."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM claims WHERE key = %s", (key,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/claims/{key}/heartbeat")
+def heartbeat_claim(key: str, auditor: str) -> dict:
+    """
+    Renueva el timestamp de un reclamo existente para evitar que expire
+    mientras el auditor sigue trabajando en el registro.
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE claims SET claimed_at = NOW()
+                WHERE key = %s AND auditor = %s
+                """,
+                (key, auditor),
+            )
+        conn.commit()
+    return {"ok": True}

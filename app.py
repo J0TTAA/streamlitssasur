@@ -6,13 +6,19 @@ Sin autenticación: abierto para cualquier médico auditor.
 from __future__ import annotations
 
 import json
+import os
+import random
+import string
 from datetime import datetime
 from pathlib import Path
 
+import requests
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 MESES_ES = {
     1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
@@ -343,23 +349,127 @@ def _inject_styles() -> None:
     )
 
 
-# ── Carga de datos ─────────────────────────────────────────────────────────────
+# ── Capa de acceso a la API ────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
-def load_jsonl(path_str: str) -> list[dict]:
-    rows: list[dict] = []
-    with Path(path_str).open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
+def _api(method: str, path: str, **kwargs) -> requests.Response:
+    """Wrapper de requests con timeout y manejo de errores básico."""
+    url = f"{API_URL}{path}"
+    r = getattr(requests, method)(url, timeout=15, **kwargs)
+    r.raise_for_status()
+    return r
 
 
-def list_jsonl_files() -> list[Path]:
-    if not DATA_DIR.is_dir():
+@st.cache_data(show_spinner=False, ttl=30)
+def api_get_files() -> list[str]:
+    """Lista de fuentes disponibles en la API (nombre del stem del archivo)."""
+    try:
+        return _api("get", "/api/files").json()
+    except Exception:
         return []
-    return sorted(DATA_DIR.glob("*.jsonl"))
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def api_get_records(fuente: str) -> list[dict]:
+    """
+    Registros de una fuente con su estado de auditoría embebido:
+      _validado: True / False / None
+      _nota_auditoria: str
+    """
+    try:
+        return _api("get", f"/api/records/{fuente}").json()
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def api_get_all_records() -> list[dict]:
+    """Todos los registros de todas las fuentes combinados (modo Todos)."""
+    fuentes = api_get_files()
+    combined: list[dict] = []
+    for f in fuentes:
+        rows = api_get_records(f)
+        for r in rows:
+            combined.append(dict(r, _src=fuente_display(f)))
+    return combined
+
+
+@st.cache_data(show_spinner=False, ttl=10)
+def api_get_claims() -> dict[str, str]:
+    """Reclamos activos: { key: auditor }."""
+    try:
+        return _api("get", "/api/claims").json()
+    except Exception:
+        return {}
+
+
+def api_put_label(key: str, status: str, note: str) -> None:
+    """Persiste la decisión de auditoría en PostgreSQL vía API."""
+    _api("put", f"/api/labels/{key}", json={"status": status, "note": note})
+    # Invalidar cachés afectadas
+    api_get_records.clear()
+    api_get_all_records.clear()
+
+
+def api_claim(key: str, auditor: str) -> tuple[bool, str]:
+    """
+    Reclama el registro para el auditor.
+    Devuelve (ok, mensaje_de_error).
+    """
+    try:
+        _api("post", f"/api/claims/{key}", params={"auditor": auditor})
+        api_get_claims.clear()
+        return True, ""
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 409:
+            detail = e.response.json().get("detail", "En revisión por otro auditor")
+            return False, detail
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+def api_release_claim(key: str) -> None:
+    """Libera el reclamo del registro."""
+    try:
+        _api("delete", f"/api/claims/{key}")
+        api_get_claims.clear()
+    except Exception:
+        pass
+
+
+def api_heartbeat(key: str, auditor: str) -> None:
+    """Renueva el reclamo para que no expire mientras el auditor sigue revisando."""
+    try:
+        _api("post", f"/api/claims/{key}/heartbeat", params={"auditor": auditor})
+    except Exception:
+        pass
+
+
+# ── Utilidades de nombre de fuente ────────────────────────────────────────────
+
+def fuente_display(fuente: str) -> str:
+    """Convierte el stem del archivo en nombre legible para el selector."""
+    name = fuente
+    for prefix in ("interconsultas_mg_", "interconsultas_"):
+        if name.lower().startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for suffix in ("_1000",):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.replace("_", " ").title()
+
+
+def load_records(choice: str) -> list[dict]:
+    """Carga los registros según la selección del usuario."""
+    if choice == "— Todos —":
+        return api_get_all_records()
+    fuentes = api_get_files()
+    for f in fuentes:
+        if fuente_display(f) == choice:
+            return api_get_records(f)
+    return []
 
 
 # ── Utilidades ─────────────────────────────────────────────────────────────────
@@ -377,22 +487,41 @@ def short(s, n: int = 28) -> str:
 
 
 def record_key(row: dict, fallback: str) -> str:
+    src = row.get("_src", "")
+    prefix = f"{src}|" if src else ""
     n = row.get("NUM_INTERCONSULTA")
     i = row.get("ID")
     if n is not None:
-        return str(n)
+        return f"{prefix}{n}"
     if i is not None:
-        return str(i)
-    return fallback
+        return f"{prefix}{i}"
+    return f"{prefix}{fallback}"
 
 
 def label_status(key: str, labels: dict) -> str:
+    """
+    Determina el estado de un registro.
+    Primero revisa el dict local de labels (compatibilidad y modo sin API),
+    luego el campo _validado que viene de la API embebido en el registro.
+    """
     v = labels.get(key)
     if v == "valid":
         return "validada"
     if v == "invalid":
         return "invalidada"
     return "pendiente"
+
+
+def row_status(row: dict, key: str, labels: dict) -> str:
+    """
+    Estado real: usa _validado del registro (API) con fallback a labels local.
+    """
+    validado = row.get("_validado")  # True / False / None — viene de la API
+    if validado is True:
+        return "validada"
+    if validado is False:
+        return "invalidada"
+    return label_status(key, labels)
 
 
 def ges_active(row: dict) -> bool:
@@ -427,7 +556,7 @@ def count_by_status(records: list[dict], labels: dict) -> dict[str, int]:
     pend = val = inv = 0
     for idx, row in enumerate(records):
         key = record_key(row, str(idx))
-        s = label_status(key, labels)
+        s = row_status(row, key, labels)
         if s == "pendiente":
             pend += 1
         elif s == "validada":
@@ -457,7 +586,7 @@ def filter_records(
         )
         if q and q not in blob:
             continue
-        st_lbl = label_status(key, labels)
+        st_lbl = row_status(row, key, labels)
         if estado == "Pendientes" and st_lbl != "pendiente":
             continue
         if estado == "Validadas" and st_lbl != "validada":
@@ -474,16 +603,75 @@ def filter_records(
     return out
 
 
+def _new_session_id() -> str:
+    """Genera un ID de sesión corto y aleatorio, ej: Auditor-3F2A."""
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"Auditor-{suffix}"
+
+
 def ensure_session_defaults() -> None:
     st.session_state.setdefault("label_by_key", {})
     st.session_state.setdefault("notes_by_key", {})
     st.session_state.setdefault("selected_key", None)
+    st.session_state.setdefault("pending_confirm", None)
+    st.session_state.setdefault("auditor_name", _new_session_id())  # asignado una vez por sesión
+    st.session_state.setdefault("claimed_key", None)
+    st.session_state.setdefault("claim_error", "")
+
+
+# ── Modal de confirmación ──────────────────────────────────────────────────────
+
+@st.dialog("Confirmar decisión de auditoría")
+def modal_confirmacion(key: str, accion: str, nota: str) -> None:
+    if accion == "valid":
+        st.markdown(
+            "### ¿Está seguro de **validar** esta interconsulta?",
+        )
+        st.info(
+            "Una vez confirmada, la interconsulta quedará **validada** y "
+            "no podrá volver a revisarse ni modificarse.",
+        )
+    else:
+        st.markdown(
+            "### ¿Está seguro de **rechazar** esta solicitud?",
+        )
+        st.warning(
+            "Una vez confirmada, la interconsulta quedará **invalidada** y "
+            "no podrá volver a revisarse ni modificarse.",
+        )
+
+    if nota.strip():
+        st.markdown("**Observación registrada:**")
+        st.caption(nota[:200] + ("…" if len(nota) > 200 else ""))
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        btn_label = "✅ Sí, validar" if accion == "valid" else "❌ Sí, rechazar"
+        if st.button(btn_label, type="primary", use_container_width=True, key="modal_confirm"):
+            with st.spinner("Guardando decisión..."):
+                try:
+                    api_put_label(key, accion, nota)
+                    # Liberar el reclamo tras decidir
+                    auditor = st.session_state.get("auditor_name", "")
+                    if auditor:
+                        api_release_claim(key)
+                    st.session_state.pending_confirm = None
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Error al guardar: {exc}")
+    with c2:
+        if st.button("Cancelar", use_container_width=True, key="modal_cancel"):
+            st.session_state.pending_confirm = None
+            st.rerun()
 
 
 # ── Componentes UI ─────────────────────────────────────────────────────────────
 
-def render_list_card(key: str, row: dict, selected: bool, labels: dict) -> None:
-    st_lbl = label_status(key, labels)
+def render_list_card(
+    key: str, row: dict, selected: bool, labels: dict, claims: dict
+) -> None:
+    st_lbl = row_status(row, key, labels)
     ges = ges_active(row)
     diag = fmt(row.get("NOM_DIAGNOSTICO"))
     diag_short = diag[:46] + ("…" if len(diag) > 46 else "")
@@ -491,10 +679,15 @@ def render_list_card(key: str, row: dict, selected: bool, labels: dict) -> None:
     origen = short(row.get("ESTABLECIMIENTO_ORIGEN"), 22)
     fecha = fmt(row.get("FECHA_IC")).split(" ")[0] if fmt(row.get("FECHA_IC")) != "—" else "—"
 
+    auditor_self = st.session_state.get("auditor_name", "")
+    claim_owner  = claims.get(key, "")
+
     if st_lbl == "validada":
         badge_html = '<span class="badge badge-green">Validada</span>'
     elif st_lbl == "invalidada":
         badge_html = '<span class="badge badge-red">Invalidada</span>'
+    elif claim_owner and claim_owner != auditor_self:
+        badge_html = f'<span class="badge badge-orange">En revisión</span>'
     else:
         badge_html = ""
 
@@ -667,7 +860,15 @@ def render_requerimientos(row: dict) -> None:
     )
 
 
-def render_panel_resolucion(key: str) -> None:
+def render_panel_resolucion(key: str, row: dict, labels: dict, claims: dict) -> None:
+    st_lbl = row_status(row, key, labels)
+    is_locked = st_lbl in ("validada", "invalidada")
+
+    # Verificar si otro auditor tiene el registro reclamado
+    auditor_self = st.session_state.get("auditor_name", "")
+    claim_owner  = claims.get(key, "")
+    blocked_by_other = claim_owner and claim_owner != auditor_self
+
     st.markdown(
         """
         <div class="section-card" style="margin-bottom:.4rem;">
@@ -677,9 +878,34 @@ def render_panel_resolucion(key: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if is_locked:
+        saved_note = row.get("_nota_auditoria") or ""
+        if st_lbl == "validada":
+            st.success("✅ Interconsulta **validada**. Esta decisión es definitiva.")
+        else:
+            st.error("❌ Solicitud **rechazada**. Esta decisión es definitiva.")
+        if saved_note.strip():
+            st.text_area(
+                "obs_locked",
+                value=saved_note,
+                height=90,
+                disabled=True,
+                label_visibility="collapsed",
+                key=f"note_locked_{key}",
+            )
+        else:
+            st.caption("Sin observaciones registradas.")
+        return
+
+    if blocked_by_other:
+        st.warning(f"⏳ En revisión por **{claim_owner}**. Espera a que termine.")
+        return
+
     note_key = f"note_input_{key}"
     if note_key not in st.session_state:
-        st.session_state[note_key] = st.session_state.notes_by_key.get(key, "")
+        saved = row.get("_nota_auditoria") or ""
+        st.session_state[note_key] = saved
 
     new_note = st.text_area(
         "obs",
@@ -697,8 +923,7 @@ def render_panel_resolucion(key: str) -> None:
             use_container_width=True,
             key=f"v_ok_{key}",
         ):
-            st.session_state.label_by_key[key] = "valid"
-            st.session_state.notes_by_key[key] = new_note
+            st.session_state.pending_confirm = {"key": key, "accion": "valid", "nota": new_note}
             st.rerun()
     with b2:
         if st.button(
@@ -707,47 +932,44 @@ def render_panel_resolucion(key: str) -> None:
             use_container_width=True,
             key=f"v_bad_{key}",
         ):
-            st.session_state.label_by_key[key] = "invalid"
-            st.session_state.notes_by_key[key] = new_note
+            st.session_state.pending_confirm = {"key": key, "accion": "invalid", "nota": new_note}
             st.rerun()
 
-    if st.button("Volver a pendiente", use_container_width=True, key=f"v_pend_{key}"):
-        st.session_state.label_by_key.pop(key, None)
-        st.session_state.notes_by_key[key] = new_note
-        st.rerun()
 
-
-def render_export_panel(all_records: list[dict], choice: str, labels: dict) -> None:
+def render_export_panel(
+    all_records: list[dict],
+    choice: str,
+    labels: dict,
+    files: list[Path] | None = None,
+) -> None:
     """
-    Panel de descarga: genera un JSON por archivo de datos
-    con todas las interconsultas que tienen label en esta sesión.
+    Panel de descarga con todas las interconsultas auditadas en la sesión.
+    En modo 'Todos' muestra chips por fuente; en modo individual, un solo bloque.
     """
-    # Separar validadas y rechazadas por el archivo activo
-    validadas  = []
-    rechazadas = []
+    validadas:  list[dict] = []
+    rechazadas: list[dict] = []
     for idx, row in enumerate(all_records):
         key = record_key(row, str(idx))
-        st_lbl = label_status(key, labels)
+        st_lbl = row_status(row, key, labels)
+        export_row = {k: v for k, v in row.items() if k not in ("_src", "_validado", "_nota_auditoria")}
         if st_lbl == "validada":
-            export_row = dict(row)
             export_row["validado"]       = True
             export_row["nota_auditoria"] = st.session_state.notes_by_key.get(key, "")
             validadas.append(export_row)
         elif st_lbl == "invalidada":
-            export_row = dict(row)
             export_row["validado"]       = False
             export_row["nota_auditoria"] = st.session_state.notes_by_key.get(key, "")
             rechazadas.append(export_row)
 
-    auditadas = validadas + rechazadas
-    display   = choice.replace("interconsultas_mg_", "").replace("_1000", "").replace(".jsonl", "").replace(".json", "")
+    auditadas  = validadas + rechazadas
+    pendientes = len(all_records) - len(auditadas)
+    label_display = choice if choice != "— Todos —" else "Todas las fuentes"
 
     chips = ""
     if validadas:
         chips += f'<span class="chip-green">✓ {len(validadas)}</span>'
     if rechazadas:
         chips += f'<span class="chip-red">✗ {len(rechazadas)}</span>'
-    pendientes = len(all_records) - len(auditadas)
     if pendientes:
         chips += f'<span class="chip-gray">⏳ {pendientes}</span>'
 
@@ -756,7 +978,7 @@ def render_export_panel(all_records: list[dict], choice: str, labels: dict) -> N
         <div class="export-panel">
           <div class="export-title">📥 Exportar interconsultas auditadas</div>
           <div class="export-row">
-            <span class="export-fuente" title="{choice}">{display}</span>
+            <span class="export-fuente">{label_display}</span>
             <span class="export-chips">{chips}</span>
           </div>
         </div>
@@ -765,8 +987,9 @@ def render_export_panel(all_records: list[dict], choice: str, labels: dict) -> N
     )
 
     if auditadas:
-        data = json.dumps(auditadas, ensure_ascii=False, indent=2).encode("utf-8")
-        fname = f"{choice.replace('.jsonl','').replace('.json','')}_auditadas.json"
+        slug = choice.lower().replace("— todos —", "todas").replace(" ", "_")
+        fname = f"interconsultas_{slug}_auditadas.json"
+        data  = json.dumps(auditadas, ensure_ascii=False, indent=2).encode("utf-8")
         st.download_button(
             label=f"⬇ Descargar JSON ({len(auditadas)} registros auditados)",
             data=data,
@@ -829,10 +1052,19 @@ def main() -> None:
     _inject_styles()
     ensure_session_defaults()
 
-    files = list_jsonl_files()
-    if not files:
-        st.error(f"No hay archivos `.jsonl` en `{DATA_DIR}`.")
+    # Mostrar modal de confirmación si hay una decisión pendiente
+    pc = st.session_state.pending_confirm
+    if pc:
+        modal_confirmacion(pc["key"], pc["accion"], pc["nota"])
+
+    # ── Cargar fuentes desde la API ───────────────────────────────────────────
+    fuentes = api_get_files()
+    if not fuentes:
+        st.error("No hay datos disponibles. Verifica que la API esté corriendo.")
         st.stop()
+
+    # Reclamos activos (compartidos entre todos los usuarios)
+    claims = api_get_claims()
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -850,17 +1082,27 @@ def main() -> None:
         )
         st.divider()
 
-        choice = st.selectbox("Archivo de datos", options=[p.name for p in files], index=0)
-        if st.session_state.get("last_jsonl") != choice:
-            st.session_state.last_jsonl = choice
-            st.session_state.selected_key = None
+        # ── Identificación de sesión (automática) ────────────────────────────
+        st.caption(f"Sesión: `{st.session_state.auditor_name}`")
 
-        records = load_jsonl(str(DATA_DIR / choice))
+        st.divider()
+
+        file_options = ["— Todos —"] + [fuente_display(f) for f in fuentes]
+        choice = st.selectbox("Fuente de datos", options=file_options, index=0)
+        if st.session_state.get("last_choice") != choice:
+            st.session_state.last_choice = choice
+            st.session_state.selected_key = None
+            # Liberar reclamo anterior al cambiar de fuente
+            if st.session_state.claimed_key:
+                api_release_claim(st.session_state.claimed_key)
+                st.session_state.claimed_key = None
+
+        records = load_records(choice)
         if not records:
-            st.warning("Archivo vacío o sin JSON válido.")
+            st.warning("Sin datos para esta fuente.")
             st.stop()
 
-        labels = st.session_state.label_by_key
+        labels: dict = {}  # sin labels locales; el estado viene de _validado en cada row
         counts = count_by_status(records, labels)
 
         search = st.text_input(
@@ -911,7 +1153,16 @@ def main() -> None:
         prio_sel = st.selectbox("Prioridad", options=["Todos"] + prios)
 
         st.divider()
-        st.caption(f"Sistema de interconsultas · {DATA_DIR.name}")
+
+        # Botón de refresco manual
+        if st.button("🔄 Actualizar datos", use_container_width=True):
+            api_get_records.clear()
+            api_get_all_records.clear()
+            api_get_claims.clear()
+            api_get_files.clear()
+            st.rerun()
+
+        st.caption("Sistema de interconsultas · DocRef")
 
     # ── Filtrar ───────────────────────────────────────────────────────────────
     filtered = filter_records(records, search, estado, espec_sel, prio_sel, labels)
@@ -930,7 +1181,25 @@ def main() -> None:
         active_key = keys_order[0]
         st.session_state.selected_key = active_key
     active_row = lookup[active_key]
-    st_lbl = label_status(active_key, labels)
+    st_lbl = row_status(active_row, active_key, labels)
+
+    # ── Claim automático al abrir un registro ─────────────────────────────────
+    auditor_name = st.session_state.auditor_name
+    prev_claimed = st.session_state.claimed_key
+
+    if active_key != prev_claimed:
+        # Liberar el reclamo anterior
+        if prev_claimed:
+            api_release_claim(prev_claimed)
+        # Intentar reclamar el nuevo
+        ok, err = api_claim(active_key, auditor_name)
+        if ok:
+            st.session_state.claimed_key = active_key
+            st.session_state.claim_error = ""
+            claims = api_get_claims()  # refrescar para mostrar badge correcto
+        else:
+            st.session_state.claimed_key = None
+            st.session_state.claim_error = err
 
     # ── Top bar ───────────────────────────────────────────────────────────────
     if st_lbl == "validada":
@@ -953,6 +1222,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    # Mostrar error de claim si existe
+    if st.session_state.claim_error:
+        st.warning(f"⚠ {st.session_state.claim_error}")
+
     # ── Layout principal: izquierda (lista) + derecha (detalle) ──────────────
     col_list, col_detail = st.columns([0.32, 0.68], gap="medium")
 
@@ -965,15 +1238,13 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         for key, row in filtered:
-            render_list_card(key, row, key == active_key, labels)
+            render_list_card(key, row, key == active_key, labels, claims)
 
     # ── Columna derecha: detalle ──────────────────────────────────────────────
     with col_detail:
-        # Fila de info (paciente | origen | destino)
         render_info_strip(active_row)
         st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
 
-        # Dos columnas: historia (izq) | requerimientos + panel (der)
         c_hist, c_req = st.columns([1.55, 1.0], gap="medium")
 
         with c_hist:
@@ -983,17 +1254,31 @@ def main() -> None:
             render_requerimientos(active_row)
             render_examenes(active_row, active_key)
             st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
-            render_panel_resolucion(active_key)
+            render_panel_resolucion(active_key, active_row, labels, claims)
 
-        # Barra de estado inferior
         render_footer_bar(active_row)
 
         st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
         render_export_panel(records, choice, labels)
 
-        # Expander JSON completo (colapsado por defecto)
         with st.expander("Ver todos los campos (JSON)", expanded=False):
             st.json(active_row)
+
+    # ── Auto-refresco: indicador de actividad compartida ─────────────────────
+    # El fragment se re-ejecuta cada 30 s de forma independiente al resto de la
+    # página, mostrando cuántos reclamos activos hay en tiempo real.
+    @st.fragment(run_every=30)
+    def live_claims_indicator() -> None:
+        api_get_claims.clear()
+        current_claims = api_get_claims()
+        n = len(current_claims)
+        if n:
+            auditores = ", ".join(sorted(set(current_claims.values())))
+            st.caption(f"🟢 {n} auditor{'es' if n > 1 else ''} activo{'s' if n > 1 else ''}: {auditores}")
+        else:
+            st.caption("Sin auditores activos en este momento.")
+
+    live_claims_indicator()
 
 
 if __name__ == "__main__":
