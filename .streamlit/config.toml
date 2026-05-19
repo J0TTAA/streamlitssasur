@@ -1,0 +1,10 @@
+# Tema claro forzado (legibilidad: texto oscuro sobre fondo claro)
+[theme]
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f9"
+textColor = "#111827"
+
+[browser]
+gatherUsageStats = false
