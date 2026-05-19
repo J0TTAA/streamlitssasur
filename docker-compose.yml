@@ -2,48 +2,51 @@ version: "3.9"
 
 # ── Servicios ─────────────────────────────────────────────────────────────────
 #
-#   db        → PostgreSQL 16          :5432
-#   api       → FastAPI                :8000  (siembra la DB al arrancar)
-#   frontend  → Streamlit              :8501  (consume la API)
+#   db        → PostgreSQL 16   (solo red interna)
+#   api       → FastAPI         (solo red interna)
+#   frontend  → Streamlit       (solo red interna)
+#   nginx     → Reverse proxy   :80  (único servicio expuesto al exterior)
 #
-# Primer uso  : docker compose up --build
-# Rebuild API : docker compose up --build api
+# Desarrollo local : docker compose up --build
+# Producción (VM)  : cp .env.example .env  →  editar  →  bash deploy.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── Base de datos ────────────────────────────────────────────────────────────
+  # ── Base de datos ─────────────────────────────────────────────────────────
   db:
     image: postgres:16-alpine
     container_name: interconsultas_db
     environment:
-      POSTGRES_USER:     interconsultas
-      POSTGRES_PASSWORD: interconsultas
-      POSTGRES_DB:       interconsultas
+      POSTGRES_USER:     ${POSTGRES_USER:-interconsultas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-interconsultas}
+      POSTGRES_DB:       ${POSTGRES_DB:-interconsultas}
     volumes:
       - pg_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"          # expuesto para herramientas locales (opcional)
+    # En producción NO exponer el puerto al exterior; descomenta solo para debug
+    # ports:
+    #   - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U interconsultas -d interconsultas"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-interconsultas} -d ${POSTGRES_DB:-interconsultas}"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 10s
     restart: unless-stopped
 
-  # ── API ───────────────────────────────────────────────────────────────────────
+  # ── API ───────────────────────────────────────────────────────────────────
   api:
     build:
       context: ./api
     container_name: interconsultas_api
+    # Puerto expuesto solo para desarrollo local; en producción nginx lo cubre
     ports:
-      - "8000:8000"
+      - "${API_BIND:-127.0.0.1}:8000:8000"
     volumes:
-      - ./data:/data:ro          # JSON de semilla (solo lectura)
+      - ./data:/data:ro
     environment:
       DATA_DIR:     /data
-      DATABASE_URL: postgresql://interconsultas:interconsultas@db:5432/interconsultas
+      DATABASE_URL: postgresql://${POSTGRES_USER:-interconsultas}:${POSTGRES_PASSWORD:-interconsultas}@db:5432/${POSTGRES_DB:-interconsultas}
     depends_on:
       db:
         condition: service_healthy
@@ -56,18 +59,34 @@ services:
       retries: 6
       start_period: 40s
 
-  # ── Frontend ──────────────────────────────────────────────────────────────────
+  # ── Frontend ──────────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
     container_name: interconsultas_frontend
+    # Puerto expuesto solo para desarrollo local; en producción nginx lo cubre
     ports:
-      - "8501:8501"
+      - "${FRONTEND_BIND:-127.0.0.1}:8501:8501"
     environment:
       API_URL: http://api:8000
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
+
+  # ── Nginx reverse proxy ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: interconsultas_nginx
+    ports:
+      - "80:80"
+      # - "443:443"    # descomentar cuando tengas SSL
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # - ./nginx/certs:/etc/nginx/certs:ro   # para SSL: montar certificados
+    depends_on:
+      - frontend
+      - api
     restart: unless-stopped
 
 # ── Volúmenes ─────────────────────────────────────────────────────────────────

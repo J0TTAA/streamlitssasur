@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import string
 from datetime import datetime
 from typing import Optional
 
@@ -31,9 +33,16 @@ def fetch_files() -> list[str]:
     return r.json()
 
 
-@st.cache_data(show_spinner=False, ttl=600)
-def fetch_records(fuente: str) -> list[dict]:
-    r = requests.get(f"{API_URL}/api/records/{fuente}", timeout=60)
+PAGE_SIZE = 50  # registros por página
+
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_records(fuente: str, page: int = 1) -> dict:
+    """Devuelve {total, page, page_size, records} de la API paginada."""
+    r = requests.get(
+        f"{API_URL}/api/records/{fuente}",
+        params={"page": page, "page_size": PAGE_SIZE},
+        timeout=30,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -50,10 +59,46 @@ def _api_set_label(key: str, status: str, note: str) -> None:
         json={"status": status, "note": note},
         timeout=10,
     )
+    fetch_records.clear()  # invalida todas las páginas cacheadas
 
 
 def _api_delete_label(key: str) -> None:
     requests.delete(f"{API_URL}/api/labels/{key}", timeout=10)
+    fetch_records.clear()
+
+
+@st.cache_data(show_spinner=False, ttl=10)
+def fetch_claims() -> dict[str, str]:
+    r = requests.get(f"{API_URL}/api/claims", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_claim(key: str, auditor: str) -> tuple[bool, str]:
+    try:
+        r = requests.post(
+            f"{API_URL}/api/claims/{key}",
+            params={"auditor": auditor},
+            timeout=10,
+        )
+        r.raise_for_status()
+        fetch_claims.clear()
+        return True, ""
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 409:
+            detail = e.response.json().get("detail", "En revisión por otro auditor")
+            return False, detail
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+def api_release_claim(key: str) -> None:
+    try:
+        requests.delete(f"{API_URL}/api/claims/{key}", timeout=10)
+        fetch_claims.clear()
+    except Exception:
+        pass
 
 
 @st.cache_data(show_spinner=False, ttl=30)
@@ -378,6 +423,27 @@ def _inject_styles() -> None:
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
+def fuente_display(fuente: str) -> str:
+    """Convierte el stem del archivo en nombre legible para el selector."""
+    name = fuente
+    for prefix in ("interconsultas_mg_", "interconsultas_"):
+        if name.lower().startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for suffix in ("_1000",):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.replace("_", " ").title()
+
+
+def fuente_from_display(display: str, fuentes: list[str]) -> str:
+    for f in fuentes:
+        if fuente_display(f) == display:
+            return f
+    return fuentes[0] if fuentes else display
+
+
 def fmt(val) -> str:
     if val is None:
         return "—"
@@ -407,6 +473,15 @@ def label_status(key: str, labels: dict) -> str:
     if v == "invalid":
         return "invalidada"
     return "pendiente"
+
+
+def row_status(row: dict, key: str, labels: dict) -> str:
+    validado = row.get("_validado")
+    if validado is True:
+        return "validada"
+    if validado is False:
+        return "invalidada"
+    return label_status(key, labels)
 
 
 def ges_active(row: dict) -> bool:
@@ -440,7 +515,7 @@ def count_by_status(records: list[dict], labels: dict) -> dict[str, int]:
     pend = val = inv = 0
     for idx, row in enumerate(records):
         key = record_key(row, str(idx))
-        s = label_status(key, labels)
+        s = row_status(row, key, labels)
         if s == "pendiente":
             pend += 1
         elif s == "validada":
@@ -454,7 +529,6 @@ def filter_records(
     records: list[dict],
     search: str,
     estado: str,
-    espec: str,
     prio: str,
     labels: dict,
 ) -> list[tuple[str, dict]]:
@@ -470,15 +544,12 @@ def filter_records(
         )
         if q and q not in blob:
             continue
-        st_lbl = label_status(key, labels)
+        st_lbl = row_status(row, key, labels)
         if estado == "Pendientes" and st_lbl != "pendiente":
             continue
         if estado == "Validadas" and st_lbl != "validada":
             continue
         if estado == "Invalidadas" and st_lbl != "invalidada":
-            continue
-        esp = fmt(row.get("ESPECIALIDAD_DESTINO"))
-        if espec != "Todos" and esp != espec:
             continue
         pr = fmt(row.get("PRIORIDAD_DESTINO"))
         if prio != "Todos" and pr != prio:
@@ -487,10 +558,21 @@ def filter_records(
     return out
 
 
+def _new_session_id() -> str:
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"Auditor-{suffix}"
+
+
+
 def ensure_session_defaults() -> None:
     st.session_state.setdefault("label_by_key", {})
     st.session_state.setdefault("notes_by_key", {})
     st.session_state.setdefault("selected_key", None)
+    st.session_state.setdefault("pending_confirm", None)
+    st.session_state.setdefault("auditor_name", _new_session_id())
+    st.session_state.setdefault("claimed_key", None)
+    st.session_state.setdefault("claim_error", "")
+    st.session_state.setdefault("current_page", 1)
     if not st.session_state.get("labels_loaded"):
         try:
             raw = _api_get_labels()
@@ -503,10 +585,55 @@ def ensure_session_defaults() -> None:
         st.session_state.labels_loaded = True
 
 
+# ── Modal de confirmación ─────────────────────────────────────────────────────
+
+@st.dialog("Confirmar decisión de auditoría")
+def modal_confirmacion(key: str, accion: str, nota: str) -> None:
+    if accion == "valid":
+        st.markdown("### ¿Está seguro de **validar** esta interconsulta?")
+        st.info(
+            "Una vez confirmada, la interconsulta quedará **validada** y "
+            "no podrá volver a revisarse ni modificarse.",
+        )
+    else:
+        st.markdown("### ¿Está seguro de **rechazar** esta solicitud?")
+        st.warning(
+            "Una vez confirmada, la interconsulta quedará **invalidada** y "
+            "no podrá volver a revisarse ni modificarse.",
+        )
+
+    if nota.strip():
+        st.markdown("**Observación registrada:**")
+        st.caption(nota[:200] + ("…" if len(nota) > 200 else ""))
+
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        btn_label = "✅ Sí, validar" if accion == "valid" else "❌ Sí, rechazar"
+        if st.button(btn_label, type="primary", use_container_width=True, key="modal_confirm"):
+            with st.spinner("Guardando decisión..."):
+                try:
+                    _api_set_label(key, accion, nota)
+                    api_release_claim(key)
+                    st.session_state.label_by_key[key] = accion
+                    st.session_state.notes_by_key[key] = nota
+                    st.session_state.pending_confirm = None
+                    st.session_state.claimed_key = None
+                    fetch_records.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Error al guardar: {exc}")
+    with c2:
+        if st.button("Cancelar", use_container_width=True, key="modal_cancel"):
+            st.session_state.pending_confirm = None
+            st.rerun()
+
+
 # ── Componentes UI ────────────────────────────────────────────────────────────
 
-def render_list_card(key: str, row: dict, selected: bool, labels: dict) -> None:
-    st_lbl = label_status(key, labels)
+def render_list_card(
+    key: str, row: dict, selected: bool, labels: dict, claims: dict
+) -> None:
+    st_lbl = row_status(row, key, labels)
     ges = ges_active(row)
     diag = fmt(row.get("NOM_DIAGNOSTICO"))
     diag_short = diag[:46] + ("…" if len(diag) > 46 else "")
@@ -515,10 +642,15 @@ def render_list_card(key: str, row: dict, selected: bool, labels: dict) -> None:
     fecha_raw = fmt(row.get("FECHA_IC"))
     fecha = fecha_raw.split(" ")[0] if fecha_raw != "—" else "—"
 
+    auditor_self = st.session_state.get("auditor_name", "")
+    claim_owner = claims.get(key, "")
+
     if st_lbl == "validada":
         badge_html = '<span class="badge badge-green">Validada</span>'
     elif st_lbl == "invalidada":
         badge_html = '<span class="badge badge-red">Invalidada</span>'
+    elif claim_owner and claim_owner != auditor_self:
+        badge_html = '<span class="badge badge-orange">En revisión</span>'
     else:
         badge_html = ""
 
@@ -677,7 +809,13 @@ def render_requerimientos(row: dict) -> None:
     )
 
 
-def render_panel_resolucion(key: str) -> None:
+def render_panel_resolucion(key: str, row: dict, labels: dict, claims: dict) -> None:
+    st_lbl = row_status(row, key, labels)
+    is_locked = st_lbl in ("validada", "invalidada")
+    auditor_self = st.session_state.get("auditor_name", "")
+    claim_owner = claims.get(key, "")
+    blocked_by_other = claim_owner and claim_owner != auditor_self
+
     st.markdown(
         """
         <div class="section-card" style="margin-bottom:.4rem;">
@@ -687,9 +825,32 @@ def render_panel_resolucion(key: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if is_locked:
+        saved_note = row.get("_nota_auditoria") or st.session_state.notes_by_key.get(key, "")
+        if st_lbl == "validada":
+            st.success("✅ Interconsulta **validada**. Esta decisión es definitiva.")
+        else:
+            st.error("❌ Solicitud **rechazada**. Esta decisión es definitiva.")
+        if saved_note.strip():
+            st.text_area(
+                "obs_locked",
+                value=saved_note,
+                height=90,
+                disabled=True,
+                label_visibility="collapsed",
+                key=f"note_locked_{key}",
+            )
+        return
+
+    if blocked_by_other:
+        st.warning(f"⏳ En revisión por **{claim_owner}**. Espera a que termine.")
+        return
+
     note_key = f"note_input_{key}"
     if note_key not in st.session_state:
-        st.session_state[note_key] = st.session_state.notes_by_key.get(key, "")
+        saved = row.get("_nota_auditoria") or st.session_state.notes_by_key.get(key, "")
+        st.session_state[note_key] = saved
 
     new_note = st.text_area(
         "obs",
@@ -701,24 +862,22 @@ def render_panel_resolucion(key: str) -> None:
 
     b1, b2 = st.columns(2, gap="small")
     with b1:
-        if st.button("Validar pertinencia", type="primary",
-                     use_container_width=True, key=f"v_ok_{key}"):
-            st.session_state.label_by_key[key] = "valid"
-            st.session_state.notes_by_key[key] = new_note
-            try:
-                _api_set_label(key, "valid", new_note)
-            except Exception:
-                pass
+        if st.button(
+            "Validar pertinencia",
+            type="primary",
+            use_container_width=True,
+            key=f"v_ok_{key}",
+        ):
+            st.session_state.pending_confirm = {"key": key, "accion": "valid", "nota": new_note}
             st.rerun()
     with b2:
-        if st.button("Rechazar solicitud", type="secondary",
-                     use_container_width=True, key=f"v_bad_{key}"):
-            st.session_state.label_by_key[key] = "invalid"
-            st.session_state.notes_by_key[key] = new_note
-            try:
-                _api_set_label(key, "invalid", new_note)
-            except Exception:
-                pass
+        if st.button(
+            "Rechazar solicitud",
+            type="secondary",
+            use_container_width=True,
+            key=f"v_bad_{key}",
+        ):
+            st.session_state.pending_confirm = {"key": key, "accion": "invalid", "nota": new_note}
             st.rerun()
 
     if st.button("Volver a pendiente", use_container_width=True, key=f"v_pend_{key}"):
@@ -766,8 +925,7 @@ def render_export_panel(all_fuentes: list[str]) -> None:
             pendientes = s.get("pendientes", 0)
             auditadas  = validadas + rechazadas
 
-            # Nombre display: recortar prefijo largo
-            display = fuente.replace("interconsultas_mg_", "").replace("_1000", "")
+            display = fuente_display(fuente)
 
             chips = ""
             if validadas:
@@ -867,6 +1025,15 @@ def main() -> None:
 
     ensure_session_defaults()
 
+    pc = st.session_state.pending_confirm
+    if pc:
+        modal_confirmacion(pc["key"], pc["accion"], pc["nota"])
+
+    try:
+        claims = fetch_claims()
+    except Exception:
+        claims = {}
+
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown(
@@ -883,17 +1050,32 @@ def main() -> None:
         )
         st.divider()
 
-        choice = st.selectbox("Conjunto de datos", options=files, index=0)
+        st.caption(f"Sesión: `{st.session_state.auditor_name}`")
+        st.divider()
+
+        file_options = [fuente_display(f) for f in files]
+        choice_display = st.selectbox("Conjunto de datos", options=file_options, index=0)
+        choice = fuente_from_display(choice_display, files)
         if st.session_state.get("last_fuente") != choice:
             st.session_state.last_fuente = choice
             st.session_state.selected_key = None
+            st.session_state.current_page = 1
+            if st.session_state.claimed_key:
+                api_release_claim(st.session_state.claimed_key)
+                st.session_state.claimed_key = None
+
+        current_page = st.session_state.current_page
 
         with st.spinner("Cargando registros…"):
             try:
-                records = fetch_records(choice)
+                page_data = fetch_records(choice, current_page)
             except Exception as e:
                 st.error(f"Error al cargar registros: {e}")
                 st.stop()
+
+        records: list[dict] = page_data.get("records", [])
+        total_records: int  = page_data.get("total", 0)
+        total_pages: int    = max(1, -(-total_records // PAGE_SIZE))  # ceil division
 
         if not records:
             st.warning("Sin registros en esta fuente.")
@@ -936,23 +1118,48 @@ def main() -> None:
         )
         st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
-        especies = sorted(
-            {fmt(r.get("ESPECIALIDAD_DESTINO")) for r in records
-             if fmt(r.get("ESPECIALIDAD_DESTINO")) != "—"}
-        )
-        espec_sel = st.selectbox("Especialidad destino", options=["Todos"] + especies)
-
         prios = sorted(
             {fmt(r.get("PRIORIDAD_DESTINO")) for r in records
              if fmt(r.get("PRIORIDAD_DESTINO")) != "—"}
         )
         prio_sel = st.selectbox("Prioridad", options=["Todos"] + prios)
 
+        # ── Navegación de páginas ──────────────────────────────────────────────
         st.divider()
+        st.markdown(
+            f'<div style="text-align:center;color:#94a3b8;font-size:.75rem;'
+            f'font-weight:700;letter-spacing:.05em;margin-bottom:.4rem;">'
+            f'PÁGINA {current_page} / {total_pages} '
+            f'<span style="font-weight:400">({total_records} registros)</span></div>',
+            unsafe_allow_html=True,
+        )
+        pc1, pc2 = st.columns(2, gap="small")
+        with pc1:
+            prev_disabled = current_page <= 1
+            if st.button("← Anterior", use_container_width=True, disabled=prev_disabled):
+                st.session_state.current_page -= 1
+                st.session_state.selected_key = None
+                fetch_claims.clear()
+                st.rerun()
+        with pc2:
+            next_disabled = current_page >= total_pages
+            if st.button("Siguiente →", use_container_width=True, disabled=next_disabled):
+                st.session_state.current_page += 1
+                st.session_state.selected_key = None
+                fetch_claims.clear()
+                st.rerun()
+
+        st.divider()
+        if st.button("🔄 Actualizar datos", use_container_width=True):
+            fetch_files.clear()
+            fetch_records.clear()
+            fetch_claims.clear()
+            st.rerun()
+
         st.caption(f"API · {API_URL}")
 
     # ── Filtrar ───────────────────────────────────────────────────────────────
-    filtered = filter_records(records, search, estado, espec_sel, prio_sel, labels)
+    filtered = filter_records(records, search, estado, prio_sel, labels)
     if not filtered:
         st.warning("No hay resultados con los filtros actuales.")
         st.stop()
@@ -968,7 +1175,35 @@ def main() -> None:
         active_key = keys_order[0]
         st.session_state.selected_key = active_key
     active_row = lookup[active_key]
-    st_lbl = label_status(active_key, labels)
+    st_lbl = row_status(active_row, active_key, labels)
+
+    auditor_name = st.session_state.auditor_name
+    prev_claimed = st.session_state.claimed_key
+    if active_key != prev_claimed:
+        if prev_claimed:
+            api_release_claim(prev_claimed)
+        ok, err = api_claim(active_key, auditor_name)
+        if ok:
+            st.session_state.claimed_key = active_key
+            st.session_state.claim_error = ""
+            try:
+                claims = fetch_claims()
+            except Exception:
+                pass
+        else:
+            st.session_state.claimed_key = None
+            # Si el primer registro está ocupado al cargar, buscar el siguiente libre
+            fallback = next(
+                (k for k in keys_order if k != active_key and not claims.get(k)),
+                None,
+            )
+            if fallback and fallback != active_key:
+                st.session_state.selected_key = fallback
+                st.session_state.claim_error = ""
+                st.rerun()
+            else:
+                # Todos ocupados: mostrar aviso pero no bloquear la carga
+                st.session_state.claim_error = err
 
     # ── Top bar ───────────────────────────────────────────────────────────────
     if st_lbl == "validada":
@@ -991,6 +1226,9 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    if st.session_state.claim_error:
+        st.warning(f"⚠ {st.session_state.claim_error}")
+
     # ── Layout: lista + detalle ───────────────────────────────────────────────
     col_list, col_detail = st.columns([0.32, 0.68], gap="medium")
 
@@ -998,11 +1236,11 @@ def main() -> None:
         st.markdown(
             f'<p class="list-head">LISTADO DE REGISTROS</p>'
             f'<p class="dash-muted" style="margin-bottom:.6rem;">'
-            f'{len(filtered)} registro{"s" if len(filtered) != 1 else ""}</p>',
+            f'{len(filtered)} en esta página · total {total_records}</p>',
             unsafe_allow_html=True,
         )
         for key, row in filtered:
-            render_list_card(key, row, key == active_key, labels)
+            render_list_card(key, row, key == active_key, labels, claims)
 
     with col_detail:
         render_info_strip(active_row)
@@ -1015,7 +1253,7 @@ def main() -> None:
             render_requerimientos(active_row)
             render_examenes(active_row, active_key)
             st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
-            render_panel_resolucion(active_key)
+            render_panel_resolucion(active_key, active_row, labels, claims)
 
         render_footer_bar(active_row)
 
@@ -1024,6 +1262,43 @@ def main() -> None:
 
         with st.expander("Ver todos los campos (JSON)", expanded=False):
             st.json(active_row)
+
+    @st.fragment(run_every=20)
+    def live_claims_indicator() -> None:
+        """
+        Se ejecuta cada 20s mientras la pestaña esté abierta.
+        - Envía heartbeat al servidor para renovar el claim activo.
+        - Muestra cuántos auditores están activos.
+        Cuando el tab se cierra el websocket se corta y este fragment deja
+        de correr, por lo que el claim envejece y la API lo considera obsoleto.
+        """
+        claimed = st.session_state.get("claimed_key")
+        auditor = st.session_state.get("auditor_name", "")
+        if claimed and auditor:
+            try:
+                requests.post(
+                    f"{API_URL}/api/claims/{claimed}/heartbeat",
+                    params={"auditor": auditor},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        fetch_claims.clear()
+        try:
+            current_claims = fetch_claims()
+        except Exception:
+            current_claims = {}
+        n = len(current_claims)
+        if n:
+            auditores = ", ".join(sorted(set(current_claims.values())))
+            st.caption(
+                f"🟢 {n} auditor{'es' if n > 1 else ''} activo{'s' if n > 1 else ''}: {auditores}"
+            )
+        else:
+            st.caption("Sin auditores activos en este momento.")
+
+    live_claims_indicator()
 
 
 if __name__ == "__main__":

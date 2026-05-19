@@ -570,7 +570,6 @@ def filter_records(
     records: list[dict],
     search: str,
     estado: str,
-    espec: str,
     prio: str,
     labels: dict,
 ) -> list[tuple[str, dict]]:
@@ -592,9 +591,6 @@ def filter_records(
         if estado == "Validadas" and st_lbl != "validada":
             continue
         if estado == "Invalidadas" and st_lbl != "invalidada":
-            continue
-        esp = fmt(row.get("ESPECIALIDAD_DESTINO"))
-        if espec != "Todos" and esp != espec:
             continue
         pr = fmt(row.get("PRIORIDAD_DESTINO"))
         if prio != "Todos" and pr != prio:
@@ -1140,12 +1136,6 @@ def main() -> None:
 
         st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
-        especies = sorted(
-            {fmt(r.get("ESPECIALIDAD_DESTINO")) for r in records
-             if fmt(r.get("ESPECIALIDAD_DESTINO")) != "—"}
-        )
-        espec_sel = st.selectbox("Especialidad destino", options=["Todos"] + especies)
-
         prios = sorted(
             {fmt(r.get("PRIORIDAD_DESTINO")) for r in records
              if fmt(r.get("PRIORIDAD_DESTINO")) != "—"}
@@ -1165,7 +1155,7 @@ def main() -> None:
         st.caption("Sistema de interconsultas · DocRef")
 
     # ── Filtrar ───────────────────────────────────────────────────────────────
-    filtered = filter_records(records, search, estado, espec_sel, prio_sel, labels)
+    filtered = filter_records(records, search, estado, prio_sel, labels)
     if not filtered:
         st.warning("No hay resultados con los filtros actuales.")
         st.stop()
@@ -1196,10 +1186,20 @@ def main() -> None:
         if ok:
             st.session_state.claimed_key = active_key
             st.session_state.claim_error = ""
-            claims = api_get_claims()  # refrescar para mostrar badge correcto
+            claims = api_get_claims()
         else:
             st.session_state.claimed_key = None
-            st.session_state.claim_error = err
+            # Si el registro está ocupado al cargar, saltar al siguiente libre
+            fallback = next(
+                (k for k in keys_order if k != active_key and not claims.get(k)),
+                None,
+            )
+            if fallback and fallback != active_key:
+                st.session_state.selected_key = fallback
+                st.session_state.claim_error = ""
+                st.rerun()
+            else:
+                st.session_state.claim_error = err
 
     # ── Top bar ───────────────────────────────────────────────────────────────
     if st_lbl == "validada":

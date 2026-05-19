@@ -188,37 +188,46 @@ def list_files() -> list[str]:
 # ── Registros ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/records/{fuente}")
-def get_records(fuente: str) -> list[dict]:
+def get_records(fuente: str, page: int = 1, page_size: int = 50) -> dict:
     """
-    Devuelve todos los registros de una fuente.
-    Cada registro incluye el campo `_validado` con el estado de auditoría:
-        true  → validada
-        false → rechazada
-        null  → pendiente
-    y `_nota_auditoria` con la observación del médico auditor.
+    Devuelve registros paginados de una fuente.
+    Respuesta: { total, page, page_size, records: [...] }
+    Cada registro incluye `_validado` (True/False/None) y `_nota_auditoria`.
     """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    offset = (page - 1) * page_size
+
     with _conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM interconsultas WHERE fuente = %s",
+                (fuente,),
+            )
+            total: int = cur.fetchone()[0]
+
             cur.execute(
                 """
                 SELECT record, validado, nota_auditoria
                 FROM   interconsultas
                 WHERE  fuente = %s
                 ORDER  BY id
+                LIMIT  %s OFFSET %s
                 """,
-                (fuente,),
+                (fuente, page_size, offset),
             )
             rows = cur.fetchall()
 
-    if not rows:
+    if total == 0:
         raise HTTPException(status_code=404, detail=f"Fuente '{fuente}' no encontrada")
 
-    result = []
+    records = []
     for record, validado, nota in rows:
-        record["_validado"]        = validado   # True / False / None
-        record["_nota_auditoria"]  = nota or ""
-        result.append(record)
-    return result
+        record["_validado"]       = validado
+        record["_nota_auditoria"] = nota or ""
+        records.append(record)
+
+    return {"total": total, "page": page, "page_size": page_size, "records": records}
 
 
 # ── Labels (validación de interconsultas) ─────────────────────────────────────
@@ -414,7 +423,9 @@ def stats() -> dict:
 
 # ── Claims (bloqueo de registro en revisión) ──────────────────────────────────
 
-CLAIM_TTL_MINUTES = 5  # un reclamo expira si no se renueva en este tiempo
+CLAIM_TTL_MINUTES     = 2   # tiempo máximo sin heartbeat antes de expirar
+STALE_CLAIM_SECONDS   = 45  # si no hubo heartbeat en este tiempo, el claim es "obsoleto"
+                             # y otra sesión puede tomarlo automáticamente
 
 
 @app.get("/api/claims")
@@ -440,27 +451,33 @@ def get_claims() -> dict:
 def claim_record(key: str, auditor: str) -> dict:
     """
     Reclama un registro para el auditor indicado.
-    - Si ya existe un reclamo activo de OTRO auditor → 409.
-    - Si el mismo auditor ya lo tiene (heartbeat) → renueva y devuelve 200.
-    - Si no hay reclamo activo → inserta y devuelve 200.
+    - Mismo auditor (renovación/heartbeat) → 200.
+    - Otro auditor con claim FRESCO (< STALE_CLAIM_SECONDS) → 409 bloqueado.
+    - Otro auditor con claim OBSOLETO (>= STALE_CLAIM_SECONDS, sin heartbeat) → override 200.
+    - Sin claim activo → 200.
     """
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT auditor FROM claims
-                WHERE key = %s
-                  AND claimed_at > NOW() - INTERVAL '%s minutes'
+                SELECT auditor,
+                       EXTRACT(EPOCH FROM (NOW() - claimed_at))::int AS age_seconds
+                FROM   claims
+                WHERE  key = %s
+                  AND  claimed_at > NOW() - INTERVAL '%s minutes'
                 """,
                 (key, CLAIM_TTL_MINUTES),
             )
             row = cur.fetchone()
 
-        if row and row[0] != auditor:
-            raise HTTPException(
-                status_code=409,
-                detail=f"En revisión por {row[0]}",
-            )
+        if row:
+            existing_auditor, age_seconds = row
+            if existing_auditor != auditor and age_seconds < STALE_CLAIM_SECONDS:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"En revisión por {existing_auditor}",
+                )
+            # Si es obsoleto (sin heartbeat) o es el mismo auditor → override permitido
 
         with conn.cursor() as cur:
             cur.execute(
@@ -480,6 +497,19 @@ def claim_record(key: str, auditor: str) -> dict:
 @app.delete("/api/claims/{key}")
 def release_claim(key: str) -> dict:
     """Libera el reclamo de un registro."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM claims WHERE key = %s", (key,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/claims/{key}/release", status_code=200)
+def release_claim_post(key: str) -> dict:
+    """
+    Igual que DELETE /api/claims/{key} pero en POST.
+    Permite usar navigator.sendBeacon() desde el navegador al cerrar la pestaña.
+    """
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM claims WHERE key = %s", (key,))

@@ -1,202 +1,163 @@
 # DocRef Dashboard — Panel de Auditoría Clínica
 
-Sistema para revisar y validar interconsultas médicas almacenadas en archivos
-JSONL. Arquitectura monolítica en Docker con dos servicios Python.
+Sistema multi-usuario para revisar y validar interconsultas médicas. Cada auditor trabaja en su propia sesión, con bloqueo optimista de registros para evitar ediciones simultáneas.
 
 ---
 
 ## Índice
 
-1. [Arquitectura general](#1-arquitectura-general)
+1. [Arquitectura](#1-arquitectura)
 2. [Estructura de carpetas](#2-estructura-de-carpetas)
-3. [Cómo funciona el flujo completo](#3-cómo-funciona-el-flujo-completo)
-4. [Servicio API (`api/`)](#4-servicio-api-api)
-5. [Servicio Frontend (`frontend/`)](#5-servicio-frontend-frontend)
-6. [Datos (`data/`)](#6-datos-data)
-7. [Docker y despliegue](#7-docker-y-despliegue)
-8. [Variables de entorno](#8-variables-de-entorno)
+3. [Inicio rápido (desarrollo local)](#3-inicio-rápido-desarrollo-local)
+4. [Servicio API](#4-servicio-api)
+5. [Servicio Frontend](#5-servicio-frontend)
+6. [Sistema de sesiones y bloqueo de registros](#6-sistema-de-sesiones-y-bloqueo-de-registros)
+7. [Paginación](#7-paginación)
+8. [Datos](#8-datos)
 9. [Endpoints de la API](#9-endpoints-de-la-api)
-10. [Persistencia y volúmenes](#10-persistencia-y-volúmenes)
-11. [Desarrollo local sin Docker](#11-desarrollo-local-sin-docker)
-12. [Agregar nuevos datos](#12-agregar-nuevos-datos)
+10. [Variables de entorno](#10-variables-de-entorno)
+11. [Despliegue en producción](#11-despliegue-en-producción)
 
 ---
 
-## 1. Arquitectura general
+## 1. Arquitectura
 
 ```
-                ┌─────────────────────────────────┐
-                │        Docker Compose            │
-                │                                  │
-                │  ┌─────────────┐                 │
- Usuario        │  │  frontend   │  :8501           │
- (navegador) ───┼─▶│  Streamlit  │                 │
-                │  │  Python 3.11│                 │
-                │  └──────┬──────┘                 │
-                │         │  HTTP (API_URL)         │
-                │         ▼                         │
-                │  ┌─────────────┐   /data (ro)    │
-                │  │    api      │◀──────────────── ├── data/*.jsonl
-                │  │  FastAPI    │  :8000           │
-                │  │  Python 3.11│                  │
-                │  └──────┬──────┘                 │
-                │         │  SQLite                │
-                │         ▼                         │
-                │  ┌─────────────┐                 │
-                │  │  labels_db  │  volumen Docker  │
-                │  │  labels.db  │  (persistente)   │
-                │  └─────────────┘                 │
-                └─────────────────────────────────-┘
+                        Internet / Red local
+                               │
+                               ▼ :80
+                    ┌─────────────────────┐
+                    │        nginx        │  reverse proxy
+                    │   (nginx:1.27-alpine│  WebSocket pass-through
+                    └──────┬──────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+   ┌─────────────────┐       ┌─────────────────┐
+   │    frontend      │  HTTP │      api        │
+   │  Streamlit 1.x  │──────▶│   FastAPI 0.11  │
+   │  Python 3.11    │       │   Python 3.11   │
+   │  :8501 (interno)│       │  :8000 (interno)│
+   └─────────────────┘       └────────┬────────┘
+                                      │ psycopg2
+                                      ▼
+                             ┌─────────────────┐
+                             │   PostgreSQL 16  │
+                             │  volumen pg_data │
+                             └─────────────────┘
 ```
 
-- **`api`** es el único servicio que toca el sistema de archivos.
-  Lee los `.jsonl` en modo lectura y escribe las validaciones en SQLite.
-- **`frontend`** no lee archivos locales. Todo lo obtiene llamando a la API.
-- La carpeta `data/` se monta como volumen de solo lectura en `api`.
-- Las validaciones (quién aprobó/rechazó qué registro, con qué nota)
-  se guardan en `labels_db`, un volumen Docker que sobrevive reinicios.
+- **nginx** es el único punto de entrada público (puerto 80 / 443).
+- **frontend** llama a la **api** dentro de la red Docker (`http://api:8000`).
+- **api** lee los archivos JSON de `data/` (solo lectura) y persiste decisiones en **PostgreSQL**.
+- La base de datos sobrevive reinicios gracias al volumen `pg_data`.
 
 ---
 
 ## 2. Estructura de carpetas
 
 ```
-streamlit_medicos/
+streamlitssasur/
 │
-├── frontend/                   # Servicio Streamlit
-│   ├── app.py                  # Aplicación principal
-│   ├── requirements.txt        # streamlit, requests
-│   ├── Dockerfile
-│   └── .streamlit/
-│       └── config.toml         # Tema visual (colores, headless)
-│
-├── api/                        # Servicio FastAPI
-│   ├── main.py                 # Toda la lógica de la API
-│   ├── requirements.txt        # fastapi, uvicorn, pydantic
+├── api/
+│   ├── main.py              # FastAPI: endpoints, seed, claims, paginación
+│   ├── requirements.txt
 │   └── Dockerfile
 │
-├── data/                       # Carpeta de datos (semilla + lectura en vivo)
-│   └── *.jsonl                 # Un archivo por especialidad médica
+├── frontend/
+│   ├── app.py               # Streamlit: UI, sesiones, paginación, auditoría
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .streamlit/
+│       └── config.toml      # Tema visual
 │
-├── docker-compose.yml          # Orquestación de los dos servicios
-├── app.py                      # Versión standalone (sin Docker, sin API)
+├── nginx/
+│   └── nginx.conf           # Reverse proxy con soporte WebSocket
+│
+├── data/                    # Archivos JSON de interconsultas (semilla)
+│   └── *.json
+│
+├── docker-compose.yml       # Orquestación: db, api, frontend, nginx
+├── .env.example             # Plantilla de variables de entorno
+├── deploy.sh                # Script de despliegue para VM
+├── app.py                   # Versión standalone (sin Docker, sin API)
 └── README.md
 ```
 
 ---
 
-## 3. Cómo funciona el flujo completo
+## 3. Inicio rápido (desarrollo local)
 
-### Arranque
+```bash
+# Clonar el repositorio
+git clone <repo-url> && cd streamlitssasur
 
-1. `docker compose up --build` construye las dos imágenes.
-2. Docker levanta primero `api` y espera hasta que su healthcheck responda
-   `200 OK` en `/health`.
-3. Solo cuando la API está sana, Docker levanta `frontend`.
+# Copiar datos de interconsultas a data/
+cp /ruta/a/tus/datos/*.json data/
 
-### Ciclo de una sesión de usuario
+# Levantar todos los servicios
+docker compose up --build
 
-```
-Usuario abre http://localhost:8501
-        │
-        ▼
-Streamlit ejecuta main()
-        │
-        ├─▶ GET /api/files          → lista de archivos .jsonl disponibles
-        │
-        ├─▶ GET /api/labels         → validaciones previas guardadas en SQLite
-        │     (una sola vez por sesión de navegador, queda en session_state)
-        │
-        ├─▶ Usuario selecciona archivo
-        │
-        ▼
-        GET /api/records/{filename} → lista de registros del JSONL
-        (resultado cacheado 5 min en memoria de Streamlit)
-        │
-        ▼
-        Streamlit renderiza la UI con los registros filtrados
-        │
-        ├─▶ Usuario hace clic en "Validar pertinencia"
-        │     PUT /api/labels/{key}  body: {status:"valid", note:"..."}
-        │     + actualiza session_state local (sin esperar re-fetch)
-        │
-        └─▶ Usuario hace clic en "Volver a pendiente"
-              DELETE /api/labels/{key}
-              + borra clave de session_state
+# Acceso:
+#   Panel:  http://localhost       (vía nginx)
+#   API:    http://localhost/docs  (Swagger UI)
+#
+# Acceso directo sin nginx (solo desarrollo):
+#   Panel:  http://localhost:8501
+#   API:    http://localhost:8000/docs
 ```
 
-### Estado de los labels: doble escritura
-
-Los labels se mantienen en **dos lugares simultáneos**:
-
-| Lugar | Qué guarda | Para qué sirve |
-|---|---|---|
-| `st.session_state` | `label_by_key = {key: "valid"\|"invalid"}` | Respuesta inmediata en UI sin esperar API |
-| SQLite (`labels.db`) | Tabla `labels(key, status, note)` | Persistencia entre sesiones y reinicios |
-
-Al abrir el navegador por primera vez, `ensure_session_defaults()` hace un
-`GET /api/labels` y carga el estado guardado en `session_state`. Desde ese
-momento la sesión es autónoma y solo llama a la API al escribir cambios.
+Para parar:
+```bash
+docker compose down        # conserva la base de datos
+docker compose down -v     # borra también la DB (datos de auditoría)
+```
 
 ---
 
-## 4. Servicio API (`api/`)
+## 4. Servicio API
 
-**Tecnologías:** Python 3.11 · FastAPI · Uvicorn · SQLite (stdlib)
+**Stack:** Python 3.11 · FastAPI · Uvicorn · psycopg2 · PostgreSQL 16
 
-### `api/main.py` — estructura interna
-
-```python
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))   # dónde están los JSONLs
-DB_PATH  = Path(os.getenv("DB_PATH",  "/db/labels.db"))  # base SQLite
-```
-
-#### Base de datos SQLite
-
-Se crea automáticamente en el arranque (`@app.on_event("startup")`):
+### Esquema de base de datos
 
 ```sql
-CREATE TABLE IF NOT EXISTS labels (
-    key     TEXT PRIMARY KEY,           -- NUM_INTERCONSULTA o ID del registro
-    status  TEXT NOT NULL               -- 'valid' | 'invalid'
-             CHECK(status IN ('valid','invalid')),
-    note    TEXT NOT NULL DEFAULT ''    -- justificación del auditor
-)
+-- Tabla principal: una fila por interconsulta
+CREATE TABLE interconsultas (
+    id                BIGSERIAL PRIMARY KEY,
+    fuente            TEXT      NOT NULL,           -- stem del archivo JSON
+    num_interconsulta TEXT,                         -- clave de negocio
+    validado          BOOLEAN   DEFAULT NULL,       -- TRUE/FALSE/NULL
+    nota_auditoria    TEXT      NOT NULL DEFAULT '',
+    record            JSONB     NOT NULL            -- objeto completo
+);
+
+-- Tabla de labels (compatibilidad)
+CREATE TABLE labels (
+    key     TEXT PRIMARY KEY,
+    status  TEXT NOT NULL CHECK (status IN ('valid', 'invalid')),
+    note    TEXT NOT NULL DEFAULT ''
+);
+
+-- Tabla de bloqueo de registros en revisión
+CREATE TABLE claims (
+    key        TEXT PRIMARY KEY,
+    auditor    TEXT NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ```
 
-`INSERT OR REPLACE` permite upsert atómico: si la clave ya existe, la
-actualiza; si no, la inserta.
+### Semilla automática
 
-#### Seguridad path traversal
-
-Antes de leer un archivo JSONL se resuelve la ruta y se verifica que esté
-dentro de `DATA_DIR`:
-
-```python
-path = (DATA_DIR / filename).resolve()
-if DATA_DIR.resolve() not in path.parents:
-    raise HTTPException(400, "Nombre de archivo inválido")
-```
-
-Esto evita peticiones como `GET /api/records/../../etc/passwd`.
-
-#### Lectura de JSONL
-
-Se parsea línea a línea para soportar archivos grandes sin cargar todo en
-memoria de una vez:
-
-```python
-for line in f:
-    line = line.strip()
-    if line:
-        records.append(json.loads(line))
-```
+Al arrancar, si `interconsultas` está vacía, la API lee todos los `*.json` de `DATA_DIR` y los inserta. Cada archivo genera una `fuente` (nombre sin extensión). Cuando la tabla ya tiene datos, la semilla se omite.
 
 ### `api/Dockerfile`
 
 ```dockerfile
-FROM python:3.11-slim          # imagen base mínima (~60 MB)
+FROM python:3.11-slim
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
@@ -204,401 +165,231 @@ EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-### `api/requirements.txt`
-
-```
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.0.0
-```
-
 ---
 
-## 5. Servicio Frontend (`frontend/`)
+## 5. Servicio Frontend
 
-**Tecnologías:** Python 3.11 · Streamlit · requests
+**Stack:** Python 3.11 · Streamlit ≥ 1.28 · requests
 
-### `frontend/app.py` — estructura interna
-
-#### Capa de comunicación con la API
-
-```python
-API_URL = os.getenv("API_URL", "http://localhost:8000")
-
-@st.cache_data(ttl=120)          # cache 2 min: lista de archivos
-def fetch_files() -> list[str]: ...
-
-@st.cache_data(ttl=300)          # cache 5 min: registros de un JSONL
-def fetch_records(filename) -> list[dict]: ...
-
-def _api_get_labels() -> dict:   # sin cache (estado mutable)
-def _api_set_label(...): ...     # PUT
-def _api_delete_label(...): ...  # DELETE
-```
-
-El cache de `fetch_records` es crítico: con 1 192 registros por archivo,
-sin caché cada interacción del usuario provocaría un re-fetch completo.
-Con TTL 5 min, Streamlit reutiliza la lista en memoria entre reruns.
-
-#### Ciclo de render de Streamlit
-
-Streamlit re-ejecuta `main()` completo con cada interacción del usuario.
-El flujo en cada ejecución es:
+### Flujo de ejecución
 
 ```
 main()
- ├─ fetch_files()             → resultado cacheado
- ├─ ensure_session_defaults() → carga labels de API solo 1a vez (flag "labels_loaded")
- ├─ sidebar: filtros + bandeja
- ├─ fetch_records(choice)     → resultado cacheado
- ├─ filter_records(...)       → filtrado en memoria (Python puro)
- ├─ topbar HTML
- ├─ columna izquierda: tarjetas de lista
- └─ columna derecha: detalle del registro activo
-        └─ Panel de resolución médica
-               ├─ [Validar pertinencia]  → PUT /api/labels + st.rerun()
-               ├─ [Rechazar solicitud]   → PUT /api/labels + st.rerun()
-               └─ [Volver a pendiente]   → DELETE /api/labels + st.rerun()
+ ├─ fetch_files()              → GET /api/files  (caché 5 min)
+ ├─ ensure_session_defaults()  → genera Auditor-XXXX, carga labels locales
+ ├─ fetch_claims()             → GET /api/claims (caché 10 s)
+ ├─ Sidebar: selectbox fuente, bandeja, filtros, paginación
+ ├─ fetch_records(fuente, page)→ GET /api/records/{fuente}?page=N (caché 60 s)
+ ├─ filter_records(...)        → filtrado en memoria Python
+ ├─ api_claim(active_key)      → POST /api/claims/{key}
+ ├─ Topbar + layout principal
+ └─ @st.fragment(run_every=20) → heartbeat + indicador de auditores activos
 ```
 
-#### Layout visual (tres zonas)
-
-```
-┌─────────────────────────────────────────────────────┐
-│ Sidebar oscuro (#0f172a)                             │
-│  · Logo DocRef Dashboard                             │
-│  · Selectbox: archivo .jsonl                         │
-│  · Radio: Pendientes / Validadas / Invalidadas / Todos│
-│  · Badges con contadores                             │
-│  · Filtros: especialidad, prioridad, búsqueda libre  │
-└─────────────────────────────────────────────────────┘
-
-Área principal:
-┌──────────────────────────────────────────────────────┐
-│ Topbar: [IC #FOLIO]  Expediente de Interconsulta  [ESTADO] │
-├──────────────────┬───────────────────────────────────┤
-│ Lista (38%)      │ Detalle (62%)                      │
-│                  │                                    │
-│ Tarjeta folio 1  │ Fila 1:                            │
-│ Tarjeta folio 2  │   [Info paciente][Origen][Destino] │
-│ ...              │                                    │
-│                  │ Fila 2:                            │
-│                  │   [Historia clínica][Panel validación]│
-└──────────────────┴───────────────────────────────────┘
-```
-
-#### Funciones auxiliares clave
+### Funciones auxiliares clave
 
 | Función | Qué hace |
-|---|---|
-| `record_key(row, fallback)` | Extrae la clave única: prioriza `NUM_INTERCONSULTA`, cae a `ID`, luego al índice |
-| `label_status(key, labels)` | Traduce `"valid"/"invalid"/None` → `"validada"/"invalidada"/"pendiente"` |
-| `audit_badge(status)` | Texto del pill superior: `"AUDITADA"/"RECHAZADA"/"PENDIENTE AUDICIÓN"` |
-| `ges_active(row)` | Detecta si el registro es GES/AUGE revisando `ESTADO_AUGE` y `PROBLEMA_SALUD` |
-| `filter_records(...)` | Filtro combinado: búsqueda libre + estado + especialidad + prioridad |
+|---------|----------|
+| `fuente_display(fuente)` | Convierte stem del JSON en nombre legible: `interconsultas_mg_cirugia_adulto_1000` → `Cirugia Adulto` |
+| `record_key(row, fallback)` | Clave única del registro: `NUM_INTERCONSULTA` → `ID` → índice |
+| `row_status(row, key, labels)` | Estado real: usa `_validado` de la API con fallback a `labels` local |
+| `filter_records(...)` | Filtra por búsqueda libre, bandeja, prioridad |
 | `count_by_status(...)` | Contadores para los badges del sidebar |
-| `priority_label(raw)` | Convierte `"1"/"2"/"3"` → texto + color del badge |
-
-### `frontend/.streamlit/config.toml`
-
-```toml
-[theme]
-base = "light"
-primaryColor = "#2563eb"       # azul para botones primarios
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f4f6f9"
-textColor = "#111827"
-
-[server]
-headless = true                # sin abrir navegador al arrancar
-enableCORS = false
-```
-
-### `frontend/Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-EXPOSE 8501
-CMD ["streamlit", "run", "app.py",
-     "--server.port=8501",
-     "--server.address=0.0.0.0",
-     "--server.headless=true"]
-```
 
 ---
 
-## 6. Datos (`data/`)
+## 6. Sistema de sesiones y bloqueo de registros
 
-La carpeta `data/` es la única fuente de datos de interconsultas. No hay
-importación ni carga inicial a una base de datos: la API lee los archivos
-directamente en cada request (con cache en el frontend).
+Cada pestaña de navegador recibe un identificador único (`Auditor-XXXX`). Al abrir un registro, la sesión lo "reclama" para evitar que otro auditor edite el mismo folio simultáneamente.
 
-### Formato JSONL
+### Ciclo de vida de un claim
 
-Cada línea es un objeto JSON independiente. Ejemplo de un registro:
+```
+Abrir pestaña
+    → genera Auditor-XXXX (session_state, vive mientras el tab está abierto)
+
+Seleccionar registro
+    → POST /api/claims/{key}?auditor=Auditor-XXXX
+    → si otro auditor lo tiene Y está activo → 409 → saltar al siguiente libre
+
+Mientras la pestaña esté abierta
+    → @st.fragment(run_every=20): POST /api/claims/{key}/heartbeat cada 20s
+
+Cerrar pestaña
+    → websocket de Streamlit se corta → fragment deja de correr
+    → claim deja de renovarse → envejece
+
+A los 45s sin heartbeat
+    → claim se considera "obsoleto" → override automático permitido
+    → nueva sesión puede tomar el registro sin esperar los 2 min de TTL
+```
+
+### Parámetros configurables (en `api/main.py`)
+
+| Constante | Valor | Significado |
+|-----------|-------|-------------|
+| `CLAIM_TTL_MINUTES` | `2` | Tiempo máximo de vida de un claim sin renovación |
+| `STALE_CLAIM_SECONDS` | `45` | Segundos sin heartbeat para considerar el claim obsoleto y permitir override |
+
+---
+
+## 7. Paginación
+
+La API devuelve los registros en páginas para evitar cargar miles de filas de una vez.
+
+### Endpoint
+
+```
+GET /api/records/{fuente}?page=1&page_size=50
+```
+
+**Respuesta:**
+```json
+{
+  "total": 1000,
+  "page": 1,
+  "page_size": 50,
+  "records": [ { ...registro... }, ... ]
+}
+```
+
+### Frontend
+
+- `PAGE_SIZE = 50` registros por página (configurable en `frontend/app.py`).
+- El sidebar muestra `PÁGINA X / Y (N registros)` con botones **← Anterior** y **Siguiente →**.
+- Al cambiar de fuente o página se resetea la selección y se libera el claim activo.
+- Los filtros (bandeja, prioridad, búsqueda) se aplican sobre los registros de la página actual.
+
+---
+
+## 8. Datos
+
+### Formato JSON
+
+Cada archivo en `data/` debe ser un array JSON de objetos. El stem del nombre de archivo se usa como identificador de fuente:
+
+```
+data/interconsultas_mg_cirugia_adulto_1000.json  →  fuente: "interconsultas_mg_cirugia_adulto_1000"
+                                                    display: "Cirugia Adulto"
+```
+
+**Estructura mínima de cada objeto:**
 
 ```json
 {
   "NUM_INTERCONSULTA": 212616149,
-  "FECHA_IC": "2022-12-22 15:55:00",
-  "ESTABLECIMIENTO_ORIGEN": "CESFAM VILLARRICA",
-  "ESPECIALIDAD_ORIGEN": "MEDICINA GENERAL",
-  "ESTABLECIMIENTO_DESTINO": "CESFAM VILLARRICA",
-  "ESPECIALIDAD_DESTINO": "OFTALMOLOGIA",
-  "TIPO_DERIVACION": "ENTRE ESPECIALIDADES INTRA HOSPITALARIAS",
-  "MOTIVO_INTERCONSULTA": "CONSULTA",
-  "COD_DIAGNO": "H524",
   "NOM_DIAGNOSTICO": "VICIO REFRACCION PRESBICIA",
-  "ESTADO_AUGE": "NO GES",
-  "PROBLEMA_SALUD": "NO TIENE",
-  "EDAD_AÑOS": 54,
-  "PREVISION_IC": "FONASA - B",
-  "ID": "2616149",
-  "ID_PACIENTE": "1364380",
-  "HISTORIA_CLINICA": "...",
-  "SE_REQUIERE": "EVALUACION MEDICO .",
-  "EXAMENES_COMPLEMENTARIOS": null,
-  "DERIVADO_PARA": "CONFIRMACION DIAGNOSTICA",
-  "PRIORIDAD_DESTINO": "3"
+  "HISTORIA_CLINICA": "Texto del relato clínico..."
 }
 ```
 
-### Campos que usa la UI
+### Campos usados por la UI
 
-| Campo | Dónde se muestra |
-|---|---|
-| `NUM_INTERCONSULTA` | Folio en tarjeta y topbar · clave única de validación |
-| `ID` | Fallback de clave si no hay `NUM_INTERCONSULTA` |
-| `NOM_DIAGNOSTICO` | Título de la tarjeta y del detalle |
-| `COD_DIAGNO` | Badge CIE-10 en historia clínica |
-| `ESTABLECIMIENTO_ORIGEN/DESTINO` | Tarjeta y panel de origen/destino |
-| `ESPECIALIDAD_ORIGEN/DESTINO` | Filtro sidebar + panel origen/destino |
-| `FECHA_IC` | Fecha en tarjeta y detalle |
-| `HISTORIA_CLINICA` | Textarea de solo lectura en detalle |
-| `EXAMENES_COMPLEMENTARIOS` | Textarea o aviso amarillo si es null |
-| `SE_REQUIERE` | Panel de requerimientos clínicos |
-| `ESTADO_AUGE` | Detección GES (badge azul) |
-| `PROBLEMA_SALUD` | Detección GES secundaria + kv de paciente |
-| `PRIORIDAD_DESTINO` | Filtro sidebar + badge (1=alta/2=media/3=baja) |
-| `ID_PACIENTE` | kv información del paciente |
-| `EDAD_AÑOS` + `TIPO_EDAD` | kv información del paciente |
-| `PREVISION_IC` | kv información del paciente |
-| `DERIVADO_PARA` | Panel destino + requerimientos |
+| Campo | Dónde aparece |
+|-------|---------------|
+| `NUM_INTERCONSULTA` | Folio, clave de auditoría |
+| `NOM_DIAGNOSTICO` | Tarjeta y detalle |
+| `COD_DIAGNO` | Badge CIE-10 |
+| `HISTORIA_CLINICA` | Textarea de solo lectura |
+| `EXAMENES_COMPLEMENTARIOS` | Sección de exámenes |
+| `ESTABLECIMIENTO_ORIGEN/DESTINO` | Panel de origen/destino |
+| `ESPECIALIDAD_ORIGEN/DESTINO` | Panel de origen/destino |
+| `FECHA_IC` | Tarjeta y footer |
+| `PRIORIDAD_DESTINO` | Filtro y badge de prioridad |
+| `ESTADO_AUGE` + `PROBLEMA_SALUD` | Badge GES/AUGE |
+| `PREVISION_IC` | Panel paciente |
+| `EDAD_AÑOS` | Panel paciente |
 | `MOTIVO_INTERCONSULTA` | Panel requerimientos |
-| `POLICLINICO_DESTINO` | Panel destino |
+| `SE_REQUIERE` | Panel requerimientos |
+| `DERIVADO_PARA` | Panel requerimientos |
 | `TIPO_DERIVACION` | Panel origen |
+| `POLICLINICO_DESTINO` | Panel destino |
+| `GESTION_INTERCONSULTA` | Footer |
 
-### Agregar un nuevo archivo de datos
-
-Copiar cualquier `.jsonl` a la carpeta `data/`. No requiere reiniciar
-Docker; aparece en el selectbox en la próxima recarga del frontend
-(el cache de `fetch_files` expira en 2 minutos o al recargar la página).
-
----
-
-## 7. Docker y despliegue
-
-### `docker-compose.yml` explicado
-
-```yaml
-services:
-
-  api:
-    build: ./api                    # construye desde api/Dockerfile
-    ports: ["8000:8000"]
-    volumes:
-      - ./data:/data:ro             # carpeta data/ mapeada como solo lectura
-      - labels_db:/db               # volumen nombrado para SQLite
-    environment:
-      DATA_DIR: /data               # ruta interna de los JSONLs
-      DB_PATH:  /db/labels.db       # ruta interna de la base SQLite
-    healthcheck:
-      test: [python -c "urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 15s
-      retries: 5
-      start_period: 10s             # tiempo para arrancar uvicorn
-
-  frontend:
-    build: ./frontend               # construye desde frontend/Dockerfile
-    ports: ["8501:8501"]
-    environment:
-      API_URL: http://api:8000      # nombre de servicio Docker como hostname
-    depends_on:
-      api:
-        condition: service_healthy  # espera hasta que api responda OK
-
-volumes:
-  labels_db:                        # volumen gestionado por Docker
-    driver: local
-```
-
-**Por qué `http://api:8000` y no `http://localhost:8000`:**
-Dentro de la red de Docker Compose cada servicio se resuelve por su nombre
-(`api`, `frontend`). `localhost` apuntaría al propio contenedor del frontend,
-no al contenedor de la API.
-
-### Comandos útiles
+### Agregar nuevos datos
 
 ```bash
-# Levantar todo (construyendo imágenes si cambia el código)
-docker compose up --build
+# Mientras Docker está corriendo:
+cp nuevos_datos.json data/
 
-# Solo en segundo plano
-docker compose up -d --build
-
-# Ver logs en tiempo real
-docker compose logs -f
-
-# Ver logs solo de un servicio
-docker compose logs -f api
-docker compose logs -f frontend
-
-# Detener (conserva el volumen labels_db)
-docker compose down
-
-# Detener Y borrar todas las validaciones guardadas
+# La API los detecta automáticamente solo si la DB está vacía.
+# Si la DB ya tiene datos, se requiere un re-seed completo:
 docker compose down -v
-
-# Reconstruir solo un servicio sin tocar el otro
-docker compose up --build api
+docker compose up -d
 ```
-
----
-
-## 8. Variables de entorno
-
-| Variable | Servicio | Default local | Valor en Docker |
-|---|---|---|---|
-| `DATA_DIR` | api | `/data` | `/data` |
-| `DB_PATH` | api | `/db/labels.db` | `/db/labels.db` |
-| `API_URL` | frontend | `http://localhost:8000` | `http://api:8000` |
 
 ---
 
 ## 9. Endpoints de la API
 
-Documentación interactiva disponible en http://localhost:8000/docs (Swagger UI).
+Documentación interactiva: **http://localhost/docs** (Swagger UI)
 
-### `GET /health`
-Health check. Responde `{"status": "ok"}`. Lo usa Docker para verificar
-que la API esté lista antes de arrancar el frontend.
+### Registros
 
-### `GET /api/files`
-Lista los archivos `.jsonl` disponibles en `DATA_DIR`.
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check: `{"status": "ok"}` |
+| `GET` | `/api/files` | Lista de fuentes disponibles |
+| `GET` | `/api/records/{fuente}?page=1&page_size=50` | Registros paginados de una fuente |
 
-**Respuesta:**
-```json
-["OFTALMOLOGIA.jsonl", "MEDICINA_INTERNA.jsonl"]
-```
+### Auditoría
 
-### `GET /api/records/{filename}`
-Devuelve todos los registros de un archivo JSONL como lista de objetos JSON.
-Valida que el nombre no contenga path traversal.
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `GET` | `/api/labels` | Todas las validaciones guardadas |
+| `PUT` | `/api/labels/{key}` | Crear/actualizar validación `{status, note}` |
+| `DELETE` | `/api/labels/{key}` | Revertir a pendiente |
+| `GET` | `/api/export` | Exportar todas las auditadas |
+| `GET` | `/api/export/{fuente}` | Exportar auditadas de una fuente |
+| `GET` | `/api/export-stats` | Contadores por fuente |
 
-**Respuesta:** `[ { ...registro... }, ... ]`
+### Sesiones (claims)
 
-### `GET /api/labels`
-Devuelve todas las validaciones guardadas en SQLite.
-
-**Respuesta:**
-```json
-{
-  "212616165": { "status": "valid",   "note": "Pertinencia confirmada" },
-  "212616166": { "status": "invalid", "note": "Diagnóstico incompleto" }
-}
-```
-
-### `PUT /api/labels/{key}`
-Crea o actualiza una validación (upsert).
-
-**Body:**
-```json
-{ "status": "valid", "note": "Texto de justificación" }
-```
-`status` acepta solo `"valid"` o `"invalid"`. Devuelve `{"ok": true}`.
-
-### `DELETE /api/labels/{key}`
-Borra una validación (vuelve el registro a estado "pendiente").
-
-### `GET /api/export`
-Exporta todas las validaciones como lista ordenada. Útil para descargar
-el resultado de la auditoría.
-
-**Respuesta:** `[ {"key":"...", "status":"...", "note":"..."}, ... ]`
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `GET` | `/api/claims` | Claims activos: `{key: auditor}` |
+| `POST` | `/api/claims/{key}?auditor=X` | Reclamar registro |
+| `DELETE` | `/api/claims/{key}` | Liberar claim |
+| `POST` | `/api/claims/{key}/release` | Liberar claim (vía POST, para sendBeacon) |
+| `POST` | `/api/claims/{key}/heartbeat?auditor=X` | Renovar claim activo |
 
 ---
 
-## 10. Persistencia y volúmenes
+## 10. Variables de entorno
 
-```
-Docker host                    Contenedor api
-─────────────────────────────────────────────
-./data/          ──(ro)──▶  /data/            ← JSONLs (lectura)
-volumen labels_db ─────▶  /db/labels.db       ← SQLite (escritura)
-```
+### Servicio `api`
 
-- **`./data/`** se monta en modo solo lectura (`:ro`). La API no puede
-  modificar los archivos originales.
-- **`labels_db`** es un volumen Docker nombrado, gestionado por el daemon.
-  Sobrevive a `docker compose down` pero se borra con `docker compose down -v`.
-- Si el volumen aún no existe al arrancar, `_init_db()` crea la tabla
-  automáticamente al primer inicio de la API.
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `DATABASE_URL` | `postgresql://interconsultas:interconsultas@db:5432/interconsultas` | Conexión a PostgreSQL |
+| `DATA_DIR` | `/data` | Carpeta con archivos JSON de semilla |
 
----
+### Servicio `frontend`
 
-## 11. Desarrollo local sin Docker
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `API_URL` | `http://localhost:8000` | URL de la API (interna Docker: `http://api:8000`) |
 
-### Solo la API
+### Servicio `db`
 
-```bash
-cd api
-pip install -r requirements.txt
-$env:DATA_DIR = "..\data"        # PowerShell
-$env:DB_PATH  = ".\labels.db"
-uvicorn main:app --reload --port 8000
-```
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `POSTGRES_USER` | `interconsultas` | Usuario de la DB |
+| `POSTGRES_PASSWORD` | `interconsultas` | Contraseña (cambiar en producción) |
+| `POSTGRES_DB` | `interconsultas` | Nombre de la base de datos |
 
-### Solo el Frontend (apuntando a la API local)
-
-```bash
-cd frontend
-pip install -r requirements.txt
-$env:API_URL = "http://localhost:8000"   # PowerShell
-streamlit run app.py
-```
-
-### Standalone (sin API, sin Docker)
-
-El archivo `app.py` en la raíz del proyecto lee los JSONL directamente
-sin necesitar la API. Los labels se guardan solo en `session_state`
-(se pierden al cerrar el navegador).
-
-```bash
-pip install streamlit
-streamlit run app.py
-```
+Todas las variables con defaults de producción se controlan desde `.env` (ver `.env.example`).
 
 ---
 
-## 12. Agregar nuevos datos
+## 11. Despliegue en producción
 
-### Agregar un nuevo archivo JSONL
+Ver [DEPLOY.md](DEPLOY.md) para instrucciones detalladas de despliegue en VM con nginx, SSL y mantenimiento.
 
-1. Copiar el archivo `.jsonl` a la carpeta `data/`.
-2. En el frontend, recargar la página (F5). El selectbox mostrará el nuevo
-   archivo (el cache de `fetch_files` dura 2 minutos).
-3. No es necesario reiniciar Docker.
-
-### Requisitos mínimos del JSONL
-
-Cada línea debe ser un JSON válido con al menos uno de estos campos
-para que el sistema pueda identificar el registro:
-
-- `NUM_INTERCONSULTA` (preferido) — número entero o string
-- `ID` — fallback si no existe `NUM_INTERCONSULTA`
-
-El resto de campos son opcionales; si faltan se muestran como `—` en la UI.
+```bash
+# Resumen de despliegue en VM
+git clone <repo> && cd streamlitssasur
+cp .env.example .env && nano .env   # editar contraseñas
+cp /ruta/datos/*.json data/
+bash deploy.sh
+```
